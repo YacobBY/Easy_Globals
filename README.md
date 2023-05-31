@@ -1,5 +1,5 @@
 # Introduction
- EasyGlobals is An easy to use variable sharing object for Python that can quickly share complex objects between processes.
+ EasyGlobals is an easy to use variable sharing object for Python that can quickly share complex objects between processes.
 
 It uses Memcached in the background to share full objects and other complex variables between Python processes. Inspired by many closed source languages which have an easy way to share "global" variables between processes while retaining pythonic syntax.
 
