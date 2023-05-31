@@ -1,4 +1,4 @@
-from src.EasyGlobals import EasyGlobals
+from EasyGlobals2 import EasyGlobals
 globals = EasyGlobals.Globals()
 print(globals.test1)
 
