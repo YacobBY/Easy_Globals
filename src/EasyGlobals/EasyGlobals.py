@@ -19,16 +19,15 @@ class Globals:
             else:
                 return  object.__getattribute__(self, key)
 
-        # If a variable doesn't exist in the class yet, check if it is in DB first.
-        # If so create it as  local
 
-        # variable too.
         except AttributeError:
+            # If a variable doesn't exist in the class yet, check if it is in DB first.
+            # If so create it as  local variable too.
             object.__setattr__(self, 'RetrievalValueTest', self.client.get(key))
             if   self.RetrievalValueTest is not None:
-                print('added key')
+                # print('added key')
                 object.__setattr__(self, key, 'in_db')
                 return  self.RetrievalValueTest
             else:
-                print(f'ERROR: Key >> {key} << not found in Memcahced Globals!')
+                print(f'ERROR: Key --> {key} <-- not found in Memcahced Globals!')
                 raise AttributeError

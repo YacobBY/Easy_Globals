@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 
 [project]
-name = "UploadTest_Y1"
-version = "0.5.0"
+name = "EasyGlobals"
+version = "0.9.0"
 authors = [
-  { name="Example Author", email="author@example.com" },
+  { name="Yacob", email="asnaeb2@gmail.com" },
 ]
-description = "A small example package"
+description = "An easy to use variable sharing object for Python that can quickly share complex objects between processes."
 readme = "README.md"
 requires-python = ">=3.7"
 classifiers = [

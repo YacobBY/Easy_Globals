@@ -21,8 +21,7 @@ class TestClass:
 
 #  Getting and setting values from nested objects directly in the Globals can be problematic as the values are pickled while they are uploaded.
 # It's best to retrieve the object, modify it locally, and then store the entire object again
-
-# This works
+# For exmaple:
 globals.testclass = TestClass()
 print(globals.testclass.a)
 
