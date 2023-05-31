@@ -1,7 +1,7 @@
+from pymemcache.client import base
+from pymemcache import serde
+class Globals:
 
-class globals:
-    from pymemcache.client import base
-    from pymemcache import serde
     # Don t put this in init, that will break with setattr
     client = base.Client(('localhost', 11211), serde=serde.pickle_serde)
 

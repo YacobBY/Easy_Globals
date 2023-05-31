@@ -4,12 +4,15 @@ build-backend = "hatchling.build"
 
 
 [project]
-name = "easyglobalss"
-version = "0.9.1"
+name = "EasyGlobals"
+version = "0.0.1"
+dependencies = [
+    "pymemcache"
+]
 authors = [
   { name="Yacob", email="asnaeb2@gmail.com" },
 ]
-description = "An easy to use variable sharing library for Python that can quickly share complex objects between processes."
+description = "An easy to use variable sharing library for Python that can quickly share complex objects between processes as if they had shared memory."
 readme = "README.md"
 requires-python = ">=3.7"
 classifiers = [
@@ -17,6 +20,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+keywords = ['Python', 'Globals', 'Shared memory']
 
 [project.urls]
 "Homepage" = "https://github.com/YacobBY/Easy_Globals"
