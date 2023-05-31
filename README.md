@@ -17,6 +17,9 @@ print(globals.test2)
 print(globals.test3)
 ```
 
+- Keep in mind that locks are not implemented here, meaning that race conditions can happen if two processes are writing to the same variable at the same time. For example when they're both incrementing the same value in a loop this can cause unwanted behavior.
+
+- To prevent this, an easy solution is to write to a variable in only one process. Reading can be done in as many processes as desired. Writing on multiple processes is not restricted but you will need to deal with the race conditions so prepare for coding headaches if you do.
 
 # Installation
 Install Memcached which acts as the server. installation with Apt is availible on Ubuntu. Different operating systems haven't been tested yet but installation guides with Windows can be found online
@@ -30,9 +33,6 @@ Now you can install the easyglobals library:
 pip install easyglobals
 ```
 
-- Keep in mind that locks are not implemented here, meaning that race conditions can happen if two processes are writing to the same variable at the same time. For example when they're both incrementing the same value in a loop this can cause unwanted behavior.
-
-- To prevent this, an easy solution is to write to a variable in only one process. Reading can be done in as many processes as desired.
 
 # Limitations:
 - Any variable type that can be pickled should work. E.g. Numpy arrays, OpenCV images.
