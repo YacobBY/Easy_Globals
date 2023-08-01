@@ -1,33 +1,40 @@
+import logging
+import traceback
+import time
 from pymemcache.client import base
 from pymemcache import serde
-class Globals:
 
+class Globals:
     # Don t put this in init, that will break with setattr
-    client = base.Client(('localhost', 11211), serde=serde.pickle_serde)
+    memcached_ip = 'localhost'
+    memcached_port = 11211
+    memcached_globals_client = base.Client((memcached_ip, memcached_port), serde=serde.pickle_serde, connect_timeout=10, no_delay=True)
+    memcached_globals_client.cache_memlimit(8000)
+
+
+    def log_error_message_globals(self, exception):
+        if exception == ConnectionRefusedError:
+            exception_info = traceback.format_exc(limit=1)
+            logging.log(level=40 , msg=exception_info)
+            logging.log(level = 40, msg =
+                 (f'{30*"*"} Error: EasyGlobals failed to connect to Memcached. {30*"*"}\n'
+                  f'-       Is Memcahed installed? https://github.com/YacobBY/Easy_Globals \n'
+                  f'-       Is the Memcached server running on port {self.memcached_port}?'))
 
     def __setattr__(self, key, value):
-        self.client.set(key, value)
-            # Note the variable down locally
-        object.__setattr__(self, key, 'in_db')
-
-    def __getattribute__(self, key):
-        # print(f'Key: {key}')
         try:
-            # To make class itself callable
-            if object.__getattribute__(self, key) == 'in_db':
-                return self.client.get(key)
-            else:
-                return  object.__getattribute__(self, key)
+            self.memcached_globals_client.set(key, value)
+        except ConnectionRefusedError:
+            self.log_error_message_globals(ConnectionRefusedError)
 
+    def __getattr__(self, key):
+        try:
+            return self.memcached_globals_client.get(key)
+        except ConnectionRefusedError:
+            self.log_error_message_globals(ConnectionRefusedError)
 
-        except AttributeError:
-            # If a variable doesn't exist in the class yet, check if it is in DB first.
-            # If so create it as  local variable too.
-            object.__setattr__(self, 'RetrievalValueTest', self.client.get(key))
-            if   self.RetrievalValueTest is not None:
-                # print('added key')
-                object.__setattr__(self, key, 'in_db')
-                return  self.RetrievalValueTest
-            else:
-                print(f'ERROR: Key --> {key} <-- not found in Memcahced Globals!')
-                raise AttributeError
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        return setattr(self, key, value)
