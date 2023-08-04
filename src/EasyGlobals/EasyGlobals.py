@@ -2,15 +2,23 @@ import logging
 import traceback
 import time
 from pymemcache.client import base
+from pymemcache.client import PooledClient
 from pymemcache import serde
 
 class Globals:
     # Don t put this in init, that will break with setattr
     memcached_ip = 'localhost'
     memcached_port = 11211
-    memcached_globals_client = base.Client((memcached_ip, memcached_port), serde=serde.pickle_serde, connect_timeout=10, no_delay=True)
-    memcached_globals_client.cache_memlimit(8000)
+    # Added config client to set mem limit because pooledclient doesn't have this function yet
+    config_client = base.Client((memcached_ip, memcached_port), serde=serde.pickle_serde, connect_timeout=10, no_delay=True)
+    config_client.cache_memlimit(8_000) # set 8000MB memory limit
+    config_client.disconnect_all()
 
+    memcached_globals_client = base.PooledClient((memcached_ip, memcached_port), serde=serde.pickle_serde,
+                                                 connect_timeout=10,pool_idle_timeout=10, no_delay=True, allow_unicode_keys=True)
+
+    def reset_all_globals(self):
+        self.memcached_globals_client.flush_all()
 
     def log_error_message_globals(self, exception):
         if exception == ConnectionRefusedError:
