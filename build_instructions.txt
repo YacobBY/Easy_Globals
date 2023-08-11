@@ -2,5 +2,5 @@ https://packaging.python.org/en/latest/tutorials/packaging-projects/
 
 # Set version in pyproject.toml up one
 # python3 -m build
-# python3 -m pip install --upgrade twine
+# python3 -m pip install --upgrade twine pip
 # python3 -m twine upload dist/*

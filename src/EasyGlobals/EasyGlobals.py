@@ -10,12 +10,12 @@ class Globals:
     memcached_ip = 'localhost'
     memcached_port = 11211
     # Added config client to set mem limit because pooledclient doesn't have this function yet
-    config_client = base.Client((memcached_ip, memcached_port), serde=serde.pickle_serde, connect_timeout=10, no_delay=True)
+    config_client = base.Client((memcached_ip, memcached_port), serde=serde.pickle_serde, connect_timeout=10, no_delay=False)
     config_client.cache_memlimit(8_000) # set 8000MB memory limit
     config_client.disconnect_all()
 
-    memcached_globals_client = base.PooledClient((memcached_ip, memcached_port), serde=serde.pickle_serde,
-                                                 connect_timeout=10,pool_idle_timeout=10, no_delay=True, allow_unicode_keys=True)
+    memcached_globals_client = base.PooledClient((memcached_ip, memcached_port), serde=serde.compressed_serde,
+                                                 connect_timeout=10,pool_idle_timeout=10, no_delay=False)
 
     def reset_all_globals(self):
         self.memcached_globals_client.flush_all()
