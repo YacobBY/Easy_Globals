@@ -7,11 +7,12 @@ import multiprocessing
 
 g = EasyGlobals.Globals()
 # g.reset_all_globals()
-time.sleep(1)
 g.laser1 = time.time()
 g.laser2 = time.time()
 g.laser3 = time.time()
 g.laser4 = time.time()
+time.sleep(1)
+
 
 
 def retrieve_from_globals(process_id):
@@ -74,8 +75,10 @@ def retrieve_from_globals(process_id):
 g = EasyGlobals.Globals()
 print('Start reading with 4 simultaneous processes')
 processlist = []
-for i in range(4):
-    processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i+1,)))
+for i in range():
+    processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i,)))
+    processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i,)))
+    processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i,)))
     processlist[i].start()
 
 for process in processlist:

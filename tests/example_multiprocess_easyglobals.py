@@ -1,8 +1,8 @@
-# from EasyGlobals import EasyGlobals
+from EasyGlobals import EasyGlobals
 # import attribute_test as EasyGlobals
 import time
 
-from src.EasyGlobals import EasyGlobals
+# from src.EasyGlobals import EasyGlobals
 import multiprocessing
 g = EasyGlobals.Globals()
 g.reset_all_globals()
