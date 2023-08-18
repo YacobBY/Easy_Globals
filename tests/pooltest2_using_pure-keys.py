@@ -22,36 +22,37 @@ def retrieve_from_globals(process_id):
         currenttime = time.time()
 
         if process_number == 1:
-            g.laser1 = currenttime
+            g.memcached_globals_client.set(key='laser1', value=currenttime)
         elif process_number == 2:
-            g.laser2 = currenttime
-        elif process_number == 3:
-            g.laser3 = currenttime
+            g.memcached_globals_client.set(key='laser2', value=currenttime)
+        # elif process_number == 3:
+        #     g.memcached_globals_client.set(key='laser3', value=currenttime)
         elif process_number == 4:
-            g.laser4 = currenttime
-
-        if process_number == 1:
-            result = g.laser1
-        elif process_number == 2:
-            result = g.laser2
-        elif process_number == 3:
-            result = g.laser3
-        elif process_number == 4:
-            result = g.laser4
+            g.memcached_globals_client.set(key='laser4', value=currenttime)
+        #
+        # if process_number == 1:
+        #     result = g.memcached_globals_client.get(key='laser1')
+        # elif process_number == 2:
+        #     result = g.memcached_globals_client.get(key='laser2')
+        # # elif process_number == 3:
+        # #     result = g.memcached_globals_client.get(key='laser3')
+        # elif process_number == 4:
+        #     result = g.memcached_globals_client.get(key='laser4')
 
         latency = time.time() - result
         # logger.debug(f'Process: {process_number}, Latency: {latency}')
         if latency > max_latency:
             max_latency = latency
-            logger.debug(f'Process {process_number}, max latency: {max_latency}')
-
 
     logger.debug(f'Process {process_number}, max latency: {max_latency}')
 
-g.laser1 = time.time()
-g.laser2 = time.time()
-g.laser3 = time.time()
-g.laser4 = time.time()
+currenttime =time.time()
+g.memcached_globals_client.set(key='laser1', value=currenttime)
+g.memcached_globals_client.set(key='laser2', value=currenttime)
+g.memcached_globals_client.set(key='laser3', value=currenttime)
+g.memcached_globals_client.set(key='laser4', value=currenttime)
+
+
 processlist = []
 for i in range(4):
     processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i+1,)))

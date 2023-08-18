@@ -4,6 +4,7 @@ import time
 from src.EasyGlobals import EasyGlobals
 import multiprocessing
 from loguru import logger
+from tests.class_testing.Project_Classes import LaserAttributes
 
 # g.reset_all_globals()
 g = EasyGlobals.Globals()
@@ -22,6 +23,7 @@ def retrieve_from_globals(process_id):
         currenttime = time.time()
 
         if process_number == 1:
+            g.laser1 = baselaser
             g.laser1 = currenttime
         elif process_number == 2:
             g.laser2 = currenttime
@@ -48,10 +50,11 @@ def retrieve_from_globals(process_id):
 
     logger.debug(f'Process {process_number}, max latency: {max_latency}')
 
-g.laser1 = time.time()
-g.laser2 = time.time()
-g.laser3 = time.time()
-g.laser4 = time.time()
+baselaser = LaserAttributes()
+g.laser1 = baselaser
+g.laser2 = baselaser
+g.laser3 = baselaser
+g.laser4 = baselaser
 processlist = []
 for i in range(4):
     processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i+1,)))

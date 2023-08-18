@@ -18,10 +18,12 @@ time.sleep(1)
 def retrieve_from_globals(process_id):
     max_latency = 0
     g = EasyGlobals.Globals()
+
     print(process_id)
     time.sleep(1)
     for i in range(100_000):
         currenttime = time.time()
+
         if process_id == 1:
             g.laser1 = currenttime
         elif process_id == 2:
@@ -31,7 +33,6 @@ def retrieve_from_globals(process_id):
         elif process_id == 4:
             g.laser4 = currenttime
 
-        result = 0.0
         if process_id == 1:
             result = g.laser1
         elif process_id == 2:
@@ -42,9 +43,10 @@ def retrieve_from_globals(process_id):
             result = g.laser4
 
         latency = time.time() - result
-        print(f'Process: {process_id}, Latency: {latency}')
         if latency > max_latency:
             max_latency = latency
+        print(f'Process: {process_id}, Latency: {latency}')
+
 
     print(f'Process {process_id}, max latency: {max_latency}')
 
@@ -75,14 +77,14 @@ def retrieve_from_globals(process_id):
 g = EasyGlobals.Globals()
 print('Start reading with 4 simultaneous processes')
 processlist = []
-for i in range():
+for i in range(3):
     processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i,)))
     processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i,)))
     processlist.append(multiprocessing.Process(target=retrieve_from_globals, args=(i,)))
     processlist[i].start()
 
-for process in processlist:
-    process.join()
+# for process in processlist:
+#     process.join()
 print('Done reading')
 
 class myclass:

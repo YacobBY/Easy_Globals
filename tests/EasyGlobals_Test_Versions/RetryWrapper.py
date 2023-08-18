@@ -12,13 +12,13 @@ class Globals:
     # Added config client to set mem limit because pooledclient doesn't have this function yet
     config_client = base.Client((memcached_ip, memcached_port), serde=serde.pickle_serde, connect_timeout=10, no_delay=True)
     config_client.cache_memlimit(10_000) # set 10_000MB memory limit
-    config_client.disconnect_all()
+    # config_client.disconnect_all()
 
-    memcached_globals_client = base.PooledClient((memcached_ip, memcached_port), serde=serde.compressed_serde,
+    pooledClient = base.PooledClient((memcached_ip, memcached_port), serde=serde.compressed_serde,
                                                  connect_timeout=10,pool_idle_timeout=10, no_delay=True)
 
     # Wrap into retry client
-    # memcached_globals_client = RetryingClient(pooledClient,attempts=3)
+    memcached_globals_client = RetryingClient(pooledClient,attempts=3)
 
     def reset_all_globals(self):
         self.memcached_globals_client.flush_all()
@@ -46,14 +46,21 @@ class Globals:
         except ConnectionRefusedError:
             self.log_error_message_globals(ConnectionRefusedError)
             return
-
-        # On a cache miss, just retry up to 20 times. Doing it this way seems faster than the retryingclient wrapper.
-        except Exception:
+        except Exception as E:
             for i  in range(20):
                 try:
+                    print(f'Retry {i}')
                     return self.memcached_globals_client.get(key)
                 except:
                     continue
+
+        # except Exception as E:
+        #     print(f'Memcache error :{E} retrying')
+        #     return self.memcached_globals_client.get(key)
+
+
+
+    #
     def __getitem__(self, key):
         return getattr(self, key)
 
