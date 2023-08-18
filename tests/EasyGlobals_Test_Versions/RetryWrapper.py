@@ -47,9 +47,8 @@ class Globals:
             self.log_error_message_globals(ConnectionRefusedError)
             return
         except Exception as E:
-            for i  in range(20):
+            for i in range(20):
                 try:
-                    print(f'Retry {i}')
                     return self.memcached_globals_client.get(key)
                 except:
                     continue
