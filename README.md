@@ -13,7 +13,7 @@ sudo apt install memcached
 sudo systemctl start memcached
 ```
 
-Now you can install the easyglobals library:
+Now you can install the easyglobals library. (optionally activate a python venv first):
 ```
 pip install easyglobals
 ```
