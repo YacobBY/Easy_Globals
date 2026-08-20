@@ -1,0 +1,86 @@
+Run 013 -- EasyGlobals 0.2.0 (shared-memory rewrite) on the Jetson (2026-07-28)
+
+0.2.0 (git 93f72e6, "Major update") is a COMPLETE REWRITE: memcached is gone;
+one shared-memory segment per namespace, per-slot seqlocks, single-writer-per-
+variable ownership, no-pickle fast path (int/float/bool/None/str/bytes/numpy),
+pickle-5 fallback for everything else. Docstring admits the lock-free protocol
+is "not formally fenced" on weakly-ordered ARM -> the Jetson is the risk case.
+
+Rig: ~/Documents/easyglobals_test/ on the Jetson (own uv-py3.14 venv, scripts,
+results). Scripts mirrored at z_Testing/easyglobals_020_*.py on the dev box.
+
+DATATYPE SUITE: ALL PASS -- every project Globals type (bool, u16/i16-edge
+ints, floats, coil-ID strings), extended (None, list, dict, tuple, bytes,
+1 MB str, 2^80 int), numpy frames (1200x1920x3 uint8 + f32), cross-process
+reads, ownership semantics (OwnershipError on foreign write, disown()
+release, dead-owner transfer).
+
+STRESS 600 s, 7 processes, CONCURRENT with the production GPU pipeline
+(1423 real OCR cycles, all 6 CPU cores ~100%, RAM 5.7/7.5 GB):
+  counter  87,239,611 writes (145k/s hot path)   0 errors
+  frame    17,123 x 7 MB uniform-fill frames     0 errors
+  payload  26,575 growth-forcing 1KB..2MB blobs  0 errors
+  plc-like 11,653 cycles x 40 mixed keys         0 errors
+  3 readers x ~90k validation sweeps: 0 TORN FRAMES, 0 non-monotonic
+  counters, 0 bad payloads, 0 exceptions. RSS flat (34-60 MB, no leak);
+  /dev/shm segment stable at 268 MB.
+
+VERDICT: works with all project datatypes; no ARM memory-ordering artifact
+observed under 10 min of maximum contention. Empirical evidence, not formal
+proof -- recommend an overnight soak before production adoption.
+
+MIGRATION NOTES for P26 (if adopted): removes the memcached SPOF (review
+blocker #1's root); initialize_default_global_values must disown() every key
+after seeding (children become owners on first write), or seeding moves into
+the owning processes; flush-all semantics -> Globals.clear().
+
+--- COMPATIBILITY PROBE (2026-07-28, eg_compat.py, both versions on Jetson) ---
+Old-vs-new datatype matrix: subclasses (IntEnum/str/float), numpy scalars,
+non-contiguous/F-order/object/0-d arrays, set/frozenset/datetime/dict: ALL
+preserved identically on BOTH (new falls back to pickle via exact type checks).
+
+BREAKS new-vs-old (semantics, not datatypes):
+1. missing key: old silently returned None; new raises AttributeError.
+2. failed write: old logged+swallowed, next read = STALE PREVIOUS VALUE
+   (proven: memoryview/lambda writes left the prior dict readable); new
+   raises loudly (PicklingError / MemoryError / OwnershipError).
+3. memoryview: old never worked (swallowed); new stores as bytes (type change).
+4. size ceiling: old chunked over memcached (8MB proven under -m 64); new
+   caps at segment capacity (256MB default, loud MemoryError; configurable).
+5. persistence: old values survived app restarts in memcached; new segment
+   is EPHEMERAL (wiped when the last attacher dies) - post-mortem inspection
+   of globals no longer possible.
+
+NEVER WORKED ON OLD, UNNOTICED (proven):
+- unpicklables: silent drop + stale-previous-value reads
+- attr names > 250 bytes (memcached key limit): silent drop, None reads
+- typo'd/missing keys: silent None (masked the two above)
+- (both versions: in-place mutation g.list.append() never propagates - copies)
+- memcached eviction: NOT reproduced at 63MB/70x900KB (all fills survived);
+  remains a theoretical silent-loss mode under real memory pressure.
+
+--- HOST PC BENCH + COMPILE (2026-07-28) ---
+Host (RTX box, x86): new-vs-old speedups even larger than Jetson — int write
+9.3->1.3us (read 23.5->0.7us, 1.4M reads/s), 900KB 2926->18us (162x), 7MB
+frame 135us (impossible on old). Old memcached itself is ~3x faster on host
+than Jetson, new shm ~2-8x faster on host than Jetson (memory bandwidth).
+COMPILABLE: yes — Cython 3 pure-mode compiles the UNMODIFIED module to a .so
+in 20s, all datatypes pass through it, but performance is IDENTICAL (hot path
+= memcpy + CPython C-API calls that pure-mode cannot shortcut). Real gains
+need the designed-for typed native port of the fixed C-friendly layout —
+which is also where formal C11 atomics could fix the ARM fencing caveat.
+
+--- DOOM SUITE (2026-07-28, easyglobals_020_doom_test.py, Jetson) ---
+ALL 9 PASS (49s): foreign writes 1000/1000 OwnershipError w/ value untouched;
+creation race 30x8-proc = exactly one winner every round; takeover after
+owner SIGKILL; SIGKILL-MID-WRITE storm (20 kills of a 7MB-frame writer):
+zero wedged readers, zero torn reads, key recoverable every time (abandoned
+odd-seqlock recovery works); 4 sibling owner threads serialized cleanly;
+slot exhaustion at 5734 keys -> loud RuntimeError, namespace usable after;
+300MB -> loud MemoryError, usable after; create/delete + grow/shrink +
+attach/detach churn: segment 1->3MB, RSS +4MB (bounded); whole-fleet SIGKILL
+massacre -> fresh attach detects stale segment and serves traffic.
+ANSWER to "is a foreign write caught?": YES — always, in every probed
+condition, incl. races and dead-owner edge cases.
+8-HOUR SOAK launched 16:50 (soak_driver.sh: 20-min stress blocks + doom
+churn per cycle) -> results/soak_8h.log on the Jetson.
