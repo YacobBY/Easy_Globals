@@ -21,9 +21,9 @@ pip install easyglobals
 That's it. Memcached is no longer used or required. (Optional: `pip install easyglobals[numpy]` if you want the numpy fast path.)
 
 # How it works
-- One process writes a variable, every process can read it. The first process to write a name becomes its owner; only the owner may overwrite or delete it. This single-writer rule is what makes lock-free reading safe (and it turns the classic "two writers race each other" headache into a clear `OwnershipError` instead of silent data corruption). Call `g.disown('name')` to hand a variable over to another process, e.g. before the owner exits.
+- One process writes a variable, every process can read it. The first process to write a name becomes its owner; only the owner may overwrite or delete it. This single-writer rule is what makes lock-free reading safe (and it turns the classic "two writers race each other" headache into a clear `OwnershipError` instead of silent data corruption). Call `g.disown('name')` to hand a variable over to another process. Ownership also ends when the owner's handle is closed (`g.close()`, or the process exiting) — a process that can no longer write a variable never blocks others from taking it over.
 - Variables live as long as your program. When the last attached process exits, everything is discarded — no stale globals leak into the next run (this replaces the old "restart memcached to clear leftovers" chore). If a run is killed, the next run detects it and starts clean.
-- Reads return copies. Mutating a nested field on a returned object doesn't change the shared value: retrieve the object, modify it, then assign it back (see `examples/example_objects.py`).
+- Reads return copies. Mutating a nested field on a returned object doesn't change the shared value: retrieve the object, modify it, then assign it back.
 - Anything picklable works: classes, dicts, OpenCV images, numpy arrays. int, float, bool, str, bytes and numpy arrays skip pickle entirely for speed.
 
 # Multiprocessing example
@@ -73,7 +73,8 @@ Note: create a `Globals()` in your main process before spawning workers (or pass
 | `g.owner_of('x')` | pid of the owning process |
 | `g.disown('x')` | give up ownership so another process may write it |
 | `g.clear()` | drop every variable in the namespace |
-| `Globals('mynamespace', capacity=..., slot_count=...)` | isolated namespace with its own sizing |
+| `g.close()` | detach this handle and release its ownership; runs automatically at exit. Any use afterwards raises `RuntimeError('handle is closed')` |
+| `Globals('mynamespace', capacity=..., slot_count=...)` | isolated namespace with its own sizing (any string works as a name; names that are not plain identifiers are hashed into the segment name, so `'cam-1'` and `'cam_1'` stay distinct) |
 
 Reading a variable that doesn't exist raises `AttributeError`/`KeyError` (use `g.get('x', default)` for a soft read). Writing a variable owned by another live process raises `OwnershipError`.
 
@@ -107,3 +108,8 @@ That is one to two orders of magnitude above the 0.1.x memcached engine (every a
 - Up to 256 concurrently attached processes per namespace.
 - Windows and Linux are first-class; macOS works best-effort via a slower fallback lock.
 - Python 3.8+.
+- Start worker processes with the `spawn` start method (the default on Windows and macOS; on Linux use `multiprocessing.get_context('spawn')`). `fork` is not supported: a child forked while any process holds the structural lock can block forever, and EasyGlobals emits a `RuntimeWarning` once per process when it detects one.
+
+# Changelog
+- **0.2.1** — robustness fixes on the 0.2.0 engine, no format change: no more SIGSEGV when `close()`/interpreter exit races a sibling thread's structural op; `close()` releases the process's variable ownership; dropped handles are garbage-collected instead of leaking their mapping; use-after-close raises `RuntimeError`; namespace names may contain any character without colliding; a forked child keeps the inherited variables and gets a `RuntimeWarning`; `wait_change()` no longer swallows a publish that landed while the consumer was busy; `owner_of()` returns `None` for a dead owner; an attach that fails (e.g. out of memory) can no longer unlink the live segment for everyone else; a foreign shared-memory object with the same name is reported instead of silently reaped.
+- **0.2.0** — shared-memory rewrite: memcached gone, single writer per variable, lock-free reads.

@@ -15,5 +15,5 @@ memcached-based releases.
 # `from EasyGlobals import EasyGlobals; g = EasyGlobals.Globals()` style.
 from .EasyGlobals import Globals, OwnershipError
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = ["Globals", "OwnershipError"]

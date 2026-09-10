@@ -55,7 +55,7 @@ def rss_mb():
 
 
 # ---------------------------------------------------------------- ownership --
-def race_writer(ns, barrier, round_no, queue):
+def race_writer(ns, barrier, round_no, queue, done):
     g = Globals(ns)
     barrier.wait()
     try:
@@ -63,6 +63,14 @@ def race_writer(ns, barrier, round_no, queue):
         queue.put(("won", os.getpid()))
     except OwnershipError:
         queue.put(("denied", os.getpid()))
+    # Hold the handle until every racer has reported: since 0.2.1 close()
+    # releases this process's ownership (a detached process can no longer
+    # write), so closing right after the write would let a slower racer take
+    # the variable over legitimately -- that is not the race under test.
+    try:
+        done.wait(30)
+    except Exception:
+        pass
     g.close()
 
 
@@ -73,12 +81,18 @@ def scenario_creation_race(rounds=30, procs=8):
     bad = 0
     for r in range(rounds):
         barrier = ctx.Barrier(procs)
+        done = ctx.Barrier(procs + 1)
         queue = ctx.Queue()
-        ps = [ctx.Process(target=race_writer, args=(ns, barrier, r, queue))
+        ps = [ctx.Process(target=race_writer,
+                          args=(ns, barrier, r, queue, done))
               for _ in range(procs)]
         for p in ps:
             p.start()
         verdicts = [queue.get(timeout=30) for _ in ps]
+        try:
+            done.wait(30)              # all verdicts in: racers may close now
+        except Exception:
+            pass
         for p in ps:
             p.join(10)
         winners = [pid for v, pid in verdicts if v == "won"]

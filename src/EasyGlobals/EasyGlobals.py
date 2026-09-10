@@ -62,6 +62,7 @@ unobservable, but the protocol is not formally fenced there.
 from __future__ import annotations
 
 import atexit
+import mmap
 import os
 import pickle
 import struct
@@ -69,6 +70,7 @@ import sys
 import threading
 import time
 import warnings
+import weakref
 import zlib
 from multiprocessing import shared_memory
 from struct import Struct
@@ -171,8 +173,23 @@ _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 
 
 def _safe(s: str, limit: int = 64) -> str:
-    out = "".join(c if c.isalnum() else "_" for c in s)[:limit]
-    return out or "default"
+    """Namespace name -> segment-name stem.
+
+    A name that is already a plain [A-Za-z0-9_] identifier of at most
+    `limit` chars maps to ITSELF (segment names stay readable, and existing
+    namespaces keep their exact segment). Anything else — folded
+    punctuation, non-ASCII (which the OS segment name cannot carry at all),
+    or a name long enough to be truncated — gets a digest of the ORIGINAL
+    name appended, so distinct namespaces can never collapse onto one
+    segment ('cam-1' vs 'cam_1' vs a 64-char shared prefix).
+    """
+    out = "".join(c if ("a" <= c <= "z" or "A" <= c <= "Z"
+                        or "0" <= c <= "9" or c == "_") else "_" for c in s)
+    if out == s and len(out) <= limit:
+        return out or "default"
+    import hashlib
+    tag = hashlib.sha1(s.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return f"{out[:limit - 9]}_{tag}"
 
 
 def _round_cap(n: int) -> int:
@@ -205,6 +222,135 @@ def _bump_gen(mm) -> None:
     intermediate. The generation is therefore always even when observed."""
     g = _U64.unpack_from(mm, _OFF_GEN)[0]
     mm[_OFF_GEN:_OFF_GEN + 8].cast("Q")[0] = (g + 2) & ~1
+
+
+# ---------------------------------------------------------------------------
+# Segment attach / unlink
+# ---------------------------------------------------------------------------
+
+# On Linux a POSIX shared segment IS a file under /dev/shm, so it can be
+# attached without multiprocessing.shared_memory (see _FileSegment).
+_SHM_DIR = None if _IS_WIN else (
+    "/dev/shm" if os.path.isdir("/dev/shm") else None)
+
+
+def _untrack(name: str) -> None:
+    """Drop a segment from the resource tracker: EasyGlobals manages the
+    lifetime itself (the last attacher unlinks), and the tracker would
+    otherwise unlink a live segment when its creator exits."""
+    if _IS_WIN:
+        return
+    try:
+        from multiprocessing import resource_tracker
+        resource_tracker.unregister(f"/{name}", "shared_memory")
+    except Exception:
+        pass
+
+
+def _safe_unlink(shm) -> None:
+    """Unlink a segment without desynchronising the resource tracker.
+
+    Segments are untracked at open (above), but CPython <= 3.12's
+    SharedMemory.unlink() unregisters unconditionally — the tracker daemon
+    then dies with a KeyError traceback and, worse, forgets a name it may
+    legitimately hold for a segment recreated later. Re-register right
+    before the unlink so that unregister balances out.
+    """
+    if _IS_WIN or not isinstance(shm, shared_memory.SharedMemory) \
+            or sys.version_info >= (3, 13):
+        shm.unlink()
+        return
+    reg = f"/{shm.name}"
+    try:
+        from multiprocessing import resource_tracker
+        resource_tracker.register(reg, "shared_memory")
+    except Exception:
+        shm.unlink()
+        return
+    try:
+        shm.unlink()
+    except BaseException:
+        try:
+            resource_tracker.unregister(reg, "shared_memory")
+        except Exception:
+            pass
+        raise
+
+
+class _FileSegment:
+    """A segment attached by opening its /dev/shm file directly.
+
+    multiprocessing.shared_memory.SharedMemory wraps its whole __init__ in
+    `except OSError: self.unlink(); raise` — including the ATTACH path — so
+    a single process whose mmap fails (RLIMIT_AS, ENOMEM, EMFILE) destroys
+    the namespace for every other process. Opening the tmpfs file gives the
+    identical mapping without that unlink, without the resource tracker,
+    and without keeping a second fd open.
+    """
+
+    __slots__ = ("name", "size", "buf", "_map", "_path")
+
+    def __init__(self, name: str, deadline: float = 0.0) -> None:
+        path = os.path.join(_SHM_DIR, name)
+        self._path = path
+        fd = os.open(path, os.O_RDWR)
+        try:
+            size = os.fstat(fd).st_size
+            while size < _HEADER_SIZE and time.monotonic() < deadline:
+                # The creator ftruncates only AFTER the name appears, so a
+                # zero/short size here means we attached inside the creation
+                # window of a perfectly valid segment. Same fd, same inode:
+                # re-stat until it grows instead of rejecting the segment.
+                time.sleep(0.002)
+                size = os.fstat(fd).st_size
+            if size < _HEADER_SIZE:
+                raise RuntimeError(
+                    f"shared-memory name {name!r} exists but is not an "
+                    f"EasyGlobals segment ({size} bytes)")
+            self._map = mmap.mmap(fd, size)
+        finally:
+            os.close(fd)
+        self.name = name
+        self.size = size
+        self.buf = memoryview(self._map)
+
+    def close(self) -> None:
+        try:
+            self.buf.release()
+        except Exception:
+            pass
+        self._map.close()
+
+    def unlink(self) -> None:
+        os.unlink(self._path)          # shm_unlink() on Linux is this unlink
+
+
+def _attach_segment(name: str, deadline: float = 0.0):
+    """Attach to an existing segment; never creates, never unlinks."""
+    if _SHM_DIR is not None:
+        return _FileSegment(name, deadline)
+    try:
+        return shared_memory.SharedMemory(name=name, track=False)
+    except TypeError:                  # Python < 3.13: no track kwarg
+        shm = shared_memory.SharedMemory(name=name)
+        _untrack(name)
+        return shm
+
+
+class _Released:
+    """Stands in for the mapping of a closed handle so every access reports
+    the real cause instead of memoryview's 'operation forbidden on released
+    memoryview' ValueError. Costs nothing while the handle is open."""
+
+    __slots__ = ()
+
+    def _fail(self, *_a):
+        raise RuntimeError("handle is closed")
+
+    __getitem__ = __setitem__ = __len__ = _fail
+
+
+_RELEASED = _Released()
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +739,11 @@ def _decode(blob: bytearray) -> Any:
 _MISSING = object()            # sentinel: variable not present
 _REBOUND = object()            # sentinel: slot binding moved, re-resolve
 
-_INSTANCES: list = []          # for fork re-registration
+# Live handles (fork re-registration + the interpreter-exit sweep below).
+# WEAK refs: a strong registry — or an atexit hook bound to a method — makes
+# every handle immortal, so a dropped handle never runs __del__ and leaks its
+# fd and mapping until the process hits EMFILE.
+_INSTANCES: "weakref.WeakSet" = weakref.WeakSet()
 # One write lock per namespace per process: serializes sibling threads (and
 # sibling Globals instances) of the owning process through the seqlock's
 # bump-write-bump window, which is interruptible at every bytecode. Readers
@@ -605,6 +755,50 @@ _NS_REFS: dict = {}
 # Guards _NS_REFS and the _closed flip: close() may run concurrently from a
 # worker thread, atexit and __del__, and must decrement exactly once.
 _LIFE = threading.Lock()
+
+
+class _Structural:
+    """Gate around a handle's structural (mutex-guarded) operations.
+
+    A thread blocked in pthread_mutex_lock() holds nothing but a raw address
+    into the mapping; if close() unmaps meanwhile, the hand-over writes into
+    unmapped memory and the process dies with SIGSEGV. close() therefore
+    flips _closed FIRST (so threads that have not entered fail fast, and can
+    never starve the closer) and then waits here for the in-flight operation
+    to finish before releasing the mapping.
+
+    Not on the lock-free fast path: these callers already pay a kernel
+    futex, so the uncontended Python lock is noise.
+    """
+
+    __slots__ = ("_ref",)
+
+    def __init__(self, g: "Globals") -> None:
+        # WEAK: a strong back-reference would make every handle part of a
+        # cycle, so __del__ would wait for the cyclic collector instead of
+        # releasing the mapping when the last user reference goes away.
+        self._ref = weakref.ref(g)
+
+    def __enter__(self):
+        g = self._ref()
+        if g is None or g._closed:
+            raise RuntimeError("handle is closed")
+        g._slock.acquire()
+        try:
+            if g._closed:
+                raise RuntimeError("handle is closed")
+            g._lock.__enter__()
+        except BaseException:
+            g._slock.release()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        g = self._ref()                # alive: our caller is inside a method
+        try:
+            g._lock.__exit__(*exc)
+        finally:
+            g._slock.release()
 
 
 class Globals:
@@ -632,8 +826,11 @@ class Globals:
         d(self, "_capacity_arg", capacity)
         d(self, "_slot_count_arg", slot_count)
         d(self, "_cache", {})          # name -> [slot_off, gen, hash, owned]
+        d(self, "_seen", {})           # name -> seq wait_change last delivered
         d(self, "_closed", True)       # not attached yet
         d(self, "_wlock", _NS_LOCKS.setdefault(ns, threading.Lock()))
+        d(self, "_slock", threading.RLock())   # structural ops vs close()
+        d(self, "_sync", _Structural(self))
 
         # Validate geometry BEFORE creating anything: a creator that fails
         # mid-init would otherwise leave a never-ready segment behind.
@@ -695,7 +892,7 @@ class Globals:
                         # dead + unlinking is safe; waiters detach and retry.
                         try:
                             _U32.pack_into(mm, _OFF_STATE, 2)
-                            self._shm.unlink()
+                            _safe_unlink(self._shm)
                         except Exception:
                             pass
                         raise                   # outer except detaches
@@ -736,7 +933,7 @@ class Globals:
                         # always cleanly closed by its atexit hook.
                         with _LIFE:
                             _NS_REFS[ns] = _NS_REFS.get(ns, 0) + 1
-                            _INSTANCES.append(self)
+                            _INSTANCES.add(self)
             except BaseException:
                 self._detach_handles()
                 raise
@@ -749,7 +946,6 @@ class Globals:
             raise RuntimeError(f"could not attach to namespace {ns!r}: "
                                f"segment kept dying during attach")
         d(self, "_closed", False)
-        atexit.register(self.close)
 
         if not created and (capacity != _DEFAULT_CAPACITY
                             or slot_count != _DEFAULT_SLOTS) \
@@ -783,6 +979,11 @@ class Globals:
             self._shm.close()
         except Exception:
             pass
+        # Any further access now reports "handle is closed" instead of a raw
+        # released-memoryview ValueError from deep inside a read path.
+        d = object.__setattr__
+        d(self, "_mm", _RELEASED)
+        d(self, "_mmq", _RELEASED)
 
     # ---- segment lifecycle ------------------------------------------------
 
@@ -790,24 +991,20 @@ class Globals:
     def _open_segment(name: str, capacity: int):
         """Attach by name or create; retry around races and dead segments."""
         last_err = None
+        # A segment that is still 0 bytes / short is a creator mid-ftruncate,
+        # not a foreign name: _attach_segment waits it out until this deadline
+        # rather than rejecting a perfectly valid namespace (simultaneous
+        # starts used to lose ~2.5% of their workers to that race).
+        deadline = time.monotonic() + 2.0
         for _ in range(64):
             shm = None
             try:
-                shm = shared_memory.SharedMemory(name=name, track=False)
+                shm = _attach_segment(name, deadline)
             except FileNotFoundError:
                 pass
             except ValueError:     # POSIX creator between shm_open and
                 time.sleep(0.002)  # ftruncate: "cannot mmap an empty file"
                 continue
-            except TypeError:      # Python < 3.13: no track kwarg
-                try:
-                    shm = shared_memory.SharedMemory(name=name)
-                    Globals._untrack(name)
-                except FileNotFoundError:
-                    pass
-                except ValueError:
-                    time.sleep(0.002)
-                    continue
             if shm is not None:
                 if shm.size < _HEADER_SIZE:
                     # Name collision with a foreign (non-EasyGlobals) segment
@@ -838,7 +1035,7 @@ class Globals:
                 except TypeError:
                     shm = shared_memory.SharedMemory(name=name, create=True,
                                                      size=capacity)
-                    Globals._untrack(name)
+                    _untrack(name)
                 return shm, True
             except FileExistsError as e:
                 last_err = e       # lost the creation race; attach on next spin
@@ -911,11 +1108,7 @@ class Globals:
             probe = None
             try:
                 try:
-                    probe = shared_memory.SharedMemory(name=shm.name,
-                                                       track=False)
-                except TypeError:
-                    probe = shared_memory.SharedMemory(name=shm.name)
-                    Globals._untrack(shm.name)
+                    probe = _attach_segment(shm.name)
                 except FileNotFoundError:
                     return False           # already unlinked: caller recreates
                 if (_U32.unpack_from(probe.buf, _OFF_STATE)[0] == 2 and
@@ -924,7 +1117,7 @@ class Globals:
                     with mutex:            # re-check under lock, then unlink
                         if _U32.unpack_from(mm, _OFF_STATE)[0] == 2:
                             try:
-                                shm.unlink()
+                                _safe_unlink(shm)
                             except Exception:
                                 pass
             finally:
@@ -942,16 +1135,6 @@ class Globals:
                 except Exception:
                     pass
         return False                       # POSIX never revives in place
-
-    @staticmethod
-    def _untrack(name: str) -> None:
-        if _IS_WIN:
-            return
-        try:
-            from multiprocessing import resource_tracker
-            resource_tracker.unregister(f"/{name}", "shared_memory")
-        except Exception:
-            pass
 
     def _init_segment(self, slot_count: int) -> None:
         mm, shm = self._mm, self._shm
@@ -1005,8 +1188,10 @@ class Globals:
                         # unlink() is a no-op on Windows; reclaim in place.
                         if self._claim_stillborn(cpid, ctok):
                             continue        # now state==1: re-read -> ready
-                    else:
-                        self._reap_stillborn(cpid, ctok)
+                    elif not self._reap_stillborn(cpid, ctok):
+                        raise RuntimeError(
+                            f"shared-memory name {self._shm.name!r} exists "
+                            f"but is not an EasyGlobals segment")
                     return False
             if time.monotonic() > deadline:
                 raise RuntimeError("shared segment never became ready")
@@ -1017,26 +1202,34 @@ class Globals:
                                f"restart all processes")
         return True
 
-    def _reap_stillborn(self, cpid: int, ctok: int) -> None:
+    def _reap_stillborn(self, cpid: int, ctok: int) -> bool:
         """Unlink a segment whose creator died before it became ready.
         The name is re-verified through a fresh attach right before the
         unlink so a recreated segment is never destroyed (a freshly
         created segment is zero-filled, so its creator stamp can't match
         a dead one); the remaining verify->unlink window is negligible
-        against the seconds-old corpse."""
+        against the seconds-old corpse.
+
+        Returns False when the segment is provably NOT ours — no creator
+        stamp and no magic, i.e. some other program's segment that merely
+        shares the name. (A genuine stillborn does lack the magic, which is
+        published at the end of _init_segment, so the stamp is what
+        identifies it; the caller must not retry against a foreign one.)"""
         name = self._shm.name
         probe = None
         try:
             try:
-                probe = shared_memory.SharedMemory(name=name, track=False)
-            except TypeError:
-                probe = shared_memory.SharedMemory(name=name)
-                Globals._untrack(name)
+                probe = _attach_segment(name)
+            except FileNotFoundError:
+                return True                 # already gone: caller recreates
             if _U32.unpack_from(probe.buf, _OFF_STATE)[0] == 0 \
                     and _REG_ENTRY.unpack_from(
                         probe.buf, _OFF_CREATOR) == (cpid, ctok):
+                if not cpid and bytes(
+                        probe.buf[_OFF_MAGIC:_OFF_MAGIC + 16]) != _MAGIC:
+                    return False
                 try:
-                    self._shm.unlink()
+                    _safe_unlink(self._shm)
                 except Exception:
                     pass
         except Exception:
@@ -1047,6 +1240,7 @@ class Globals:
                     probe.close()
                 except Exception:
                     pass
+        return True
 
     def _claim_stillborn(self, cpid: int, ctok: int) -> bool:
         """Windows: re-initialise a stillborn (state==0) segment IN PLACE
@@ -1087,13 +1281,15 @@ class Globals:
             pid, tok = _REG_ENTRY.unpack_from(self._mm, off)
             yield off, pid, tok
 
-    def _prune_and_maybe_wipe(self) -> None:
+    def _prune_and_maybe_wipe(self, wipe: bool = True) -> None:
         """Under lock: drop dead attachers; wipe data unless some registered
         attacher is still alive (stale state must never leak into a new run
         — even when the previous run's last process died with an already
-        empty registry, e.g. killed between deregistering and unlinking)."""
+        empty registry, e.g. killed between deregistering and unlinking).
+        `wipe=False` only prunes: a forked child continues the SAME run and
+        inherits its parent's variables even after the parent exits."""
         mm = self._mm
-        any_live = False
+        any_live = not wipe
         for off, pid, tok in self._registry_iter():
             if pid == 0:
                 continue
@@ -1126,17 +1322,19 @@ class Globals:
         raise RuntimeError(f"attacher registry full ({_REG_ENTRIES} processes)")
 
     def close(self) -> None:
-        """Detach. The last attached process unlinks the segment so no state
-        outlives the program. Registered atexit automatically; idempotent."""
+        """Detach. Ownership of every variable this process owns is released
+        (a detached process must not wedge keys it can no longer write), and
+        the last attached process unlinks the segment so no state outlives
+        the program. Runs at interpreter exit automatically; idempotent."""
         ns = self._ns
         with _LIFE:
             if object.__getattribute__(self, "_closed"):
                 return
+            # Flip _closed BEFORE waiting on _slock below: threads that have
+            # not entered a structural op yet now fail fast instead of
+            # queueing ahead of us forever.
             object.__setattr__(self, "_closed", True)
-            try:
-                _INSTANCES.remove(self)
-            except ValueError:
-                pass
+            _INSTANCES.discard(self)
             counted = ns in _NS_REFS
             last_local = False
             if counted:
@@ -1146,61 +1344,79 @@ class Globals:
                 else:
                     _NS_REFS.pop(ns, None)
                     last_local = True
-        try:
-            atexit.unregister(self.close)
-        except Exception:
-            pass
-        if not last_local:
-            # Either another Globals handle in this process still uses the
-            # namespace, or this instance was never counted (its __init__
-            # failed after attaching): keep the process registered, only
-            # drop our mapping.
+        # _slock keeps the mapping alive until any in-flight structural op
+        # (possibly parked in the in-shm mutex) has finished; unmapping under
+        # such a thread faults when the mutex is handed over.
+        with self._slock:
+            if not last_local:
+                # Either another Globals handle in this process still uses the
+                # namespace, or this instance was never counted (its __init__
+                # failed after attaching): keep the process registered, only
+                # drop our mapping.
+                self._detach_handles()
+                return
+            mm = self._mm
+            try:
+                with self._lock:
+                    # Re-verify "last local handle" now that we hold the mutex:
+                    # a sibling thread's __init__ registers AND counts under
+                    # this same mutex, so if _NS_REFS has an entry again, a live
+                    # handle (re)appeared after our decision above —
+                    # deregistering the process now would pull the segment out
+                    # from under it. Just drop our mapping instead.
+                    with _LIFE:
+                        revived = ns in _NS_REFS
+                    if not revived:
+                        self._release_ownership_locked()
+                        others = False
+                        for off, pid, tok in self._registry_iter():
+                            if pid == 0:
+                                continue
+                            if pid == _MY_PID and tok == _MY_TOKEN:
+                                _REG_ENTRY.pack_into(mm, off, 0, 0)
+                            elif _pid_alive(pid, tok):
+                                others = True
+                        if not others \
+                                and _U32.unpack_from(mm, _OFF_STATE)[0] != 2:
+                            # (Already-dead means some other closer marked it
+                            # and owns the unlink; re-unlinking BY NAME here
+                            # could destroy a fresh segment that reused the
+                            # name.)
+                            _U32.pack_into(mm, _OFF_STATE, 2)   # mark dead
+                            # Unlink while still holding the mutex: a
+                            # resurrector must take this same mutex, so it can
+                            # never revive the segment between our mark and our
+                            # unlink (a deferred unlink-by-name could otherwise
+                            # destroy the name of a segment someone just
+                            # resurrected -> split-brain).
+                            try:
+                                _safe_unlink(self._shm)      # no-op on Windows
+                            except Exception:
+                                pass
+            except Exception:
+                pass
             self._detach_handles()
-            return
+
+    def _release_ownership_locked(self) -> None:
+        """Mutex held: give up every variable this process owns. A process
+        that detached but keeps running must not wedge its keys against
+        write/delete/disown by anyone else — it can no longer write them."""
         mm = self._mm
-        try:
-            with self._lock:
-                # Re-verify "last local handle" now that we hold the mutex:
-                # a sibling thread's __init__ registers AND counts under this
-                # same mutex, so if _NS_REFS has an entry again, a live handle
-                # (re)appeared after our decision above — deregistering the
-                # process now would pull the segment out from under it. Just
-                # drop our mapping instead.
-                with _LIFE:
-                    revived = ns in _NS_REFS
-                if not revived:
-                    others = False
-                    for off, pid, tok in self._registry_iter():
-                        if pid == 0:
-                            continue
-                        if pid == _MY_PID and tok == _MY_TOKEN:
-                            _REG_ENTRY.pack_into(mm, off, 0, 0)
-                        elif _pid_alive(pid, tok):
-                            others = True
-                    if not others \
-                            and _U32.unpack_from(mm, _OFF_STATE)[0] != 2:
-                        # (Already-dead means some other closer marked it and
-                        # owns the unlink; re-unlinking BY NAME here could
-                        # destroy a fresh segment that reused the name.)
-                        _U32.pack_into(mm, _OFF_STATE, 2)   # mark dead
-                        # Unlink while still holding the mutex: a resurrector
-                        # must take this same mutex, so it can never revive the
-                        # segment between our mark and our unlink (a deferred
-                        # unlink-by-name could otherwise destroy the name of a
-                        # segment someone just resurrected -> split-brain).
-                        try:
-                            self._shm.unlink()               # no-op on Windows
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        self._detach_handles()
+        base, sc = self._slots_off, self._slot_count
+        for i in range(sc):
+            so = base + i * _SLOT_SIZE
+            f = _SLOT.unpack_from(mm, so)
+            if f[1] == _S_OCCUPIED and f[5] == _MY_PID and f[6] == _MY_TOKEN:
+                self._disown_locked(so, f)
 
     def __del__(self):
+        # Reachable again since _INSTANCES stopped holding strong refs: a
+        # handle dropped without close() releases its mapping here instead of
+        # leaking it (and the process's registration) for the whole run.
         try:
             self.close()
         except Exception:
-            pass
+            pass                       # interpreter teardown: partial state
 
     # Pickle support: passing g to a child process reattaches by namespace,
     # carrying the geometry so a child that ends up re-creating the segment
@@ -1234,13 +1450,21 @@ class Globals:
         """A slot stayed odd for seconds: its writer died mid-write. Under
         the mutex, tombstone the torn value so the namespace stays usable."""
         mm = self._mm
-        with self._lock:
+        with self._sync:
             f = _SLOT.unpack_from(mm, so)
             if not (f[0] & 1):
                 return                          # recovered by itself
-            if f[5] and _pid_alive(f[5], f[6]):
-                return                          # writer alive, keep waiting
-            self._tombstone_locked(so)
+            if f[5]:
+                if _pid_alive(f[5], f[6]):
+                    return                      # writer alive, keep waiting
+                self._tombstone_locked(so)      # dead writer: the blob is torn
+                return
+            # Owner 0: claiming a slot stamps ownership under this mutex, so
+            # no write can be in flight here — the odd bit is a stray store
+            # from a binding a relocation invalidated, and the blob itself is
+            # whole. Republish ABOVE the stray odd instead of destroying a
+            # perfectly good (disowned) variable.
+            _seq_publish(mm, so, f[0] + 1)
 
     def _gen_stable(self) -> int:
         """Current generation, waiting out an in-flight bump (odd transit).
@@ -1257,7 +1481,7 @@ class Globals:
             if spins > 200:
                 time.sleep(0.0001)
                 if spins > 5000:
-                    with self._lock:
+                    with self._sync:
                         if mmq[_OFF_GEN_W] & 1:
                             _bump_gen(mm)      # folds the dead transit in
                     spins = 0
@@ -1353,7 +1577,14 @@ class Globals:
             deadline = time.monotonic() + 5.0
             while mmq[so >> 3] & 1:               # atomic seq load
                 f = _SLOT.unpack_from(mm, so)
-                if not f[5] or not _pid_alive(f[5], f[6]):
+                if not f[5]:
+                    # Unowned: no write can be in flight (claiming a slot
+                    # stamps ownership under this mutex), so this is a stray
+                    # odd store from an invalidated binding, not a torn value
+                    # — republish above it instead of dropping the variable.
+                    _seq_publish(mm, so, f[0] + 1)
+                    break
+                if not _pid_alive(f[5], f[6]):
                     _SLOT.pack_into(mm, so, f[0], _S_TOMB,
                                     0, 0, 0, 0, 0, 0, 0, 0)
                     _bump_gen(mm)                # pre-publish replay immunity
@@ -1379,7 +1610,10 @@ class Globals:
         for i in range(sc):
             so = base + i * _SLOT_SIZE
             f = _SLOT.unpack_from(mm, so)
-            if f[0] & 1 and (not f[5] or not _pid_alive(f[5], f[6])):
+            if f[0] & 1 and not f[5]:
+                _seq_publish(mm, so, f[0] + 1)   # stray bump, intact blob
+                f = _SLOT.unpack_from(mm, so)
+            elif f[0] & 1 and not _pid_alive(f[5], f[6]):
                 _SLOT.pack_into(mm, so, f[0], _S_TOMB,
                                 0, 0, 0, 0, 0, 0, 0, 0)
                 _bump_gen(mm)                # pre-publish replay immunity
@@ -1560,7 +1794,7 @@ class Globals:
                         # ---- lock-free fast path ----
                         mmq[sw] = s + 1                      # seq -> odd (atomic)
                         if mmq[_gen_w] != ent[1]:
-                            self._repair_bumped(name, so)    # see helper
+                            self._back_out(name, sw, s)      # see helper
                         elif mmq[_frz_w]:
                             mmq[sw] = s        # ours: settle awaits evenness
                         else:
@@ -1594,7 +1828,7 @@ class Globals:
                     # shows up as freeze; one starting later is held off by
                     # our odd seq (its settle waits for us).
                     if mmq[_gen_w] != ent[1]:
-                        self._repair_bumped(name, so)        # see helper
+                        self._back_out(name, sw, s)          # see helper
                     elif mmq[_frz_w]:
                         mmq[sw] = s            # ours: settle awaits evenness
                     else:
@@ -1612,32 +1846,27 @@ class Globals:
                         return
             self._set_slow(name, tag, header, payload, blob_len)
 
-    def _repair_bumped(self, name: str, so: int) -> None:
-        """The generation moved between our cached check and the odd bump:
-        a structural op COMPLETED inside our preemption window, so the slot
-        at `so` may belong to a different variable now, and our blind
-        s+1/back-out stores may have REGRESSED its seq below published
-        history (seq ABA: a reader's stale s1 could match again later).
+    def _back_out(self, name: str, sw: int, s: int) -> None:
+        """The generation moved between our cached check and the odd bump: a
+        structural op COMPLETED inside our preemption window, so the slot may
+        belong to a different variable now. NOTHING has been written yet, so
+        restore the sequence we found and drop the binding; the caller
+        re-resolves under the mutex.
 
-        Restoring the stale value lock-free would keep the regression.
-        Instead repair under the mutex (the structural op is over, so no
-        settle is waiting on us — no deadlock): bump the generation FIRST so
-        every binding and every in-flight reader validation against this
-        slot fails, then publish an even seq above whatever is there now
-        (were the publish first, a reader could match a replayed counter
-        value in the bump-publish gap and validate against the old gen).
+        Restoring immediately is what matters: a slot left odd while its
+        writer waits for the structural mutex deadlocks against
+        _freeze_and_settle (which holds that mutex until every slot is even)
+        and invites the recovery paths to read 'odd, no live owner' as a torn
+        value. Readers merely retry across the odd blip; the store order
+        (odd, validate, restore) needs no fence on x86-64's ordered stores.
         """
-        mm = self._mm
-        with self._lock:
-            cur = _U64.unpack_from(mm, so)[0]
-            _bump_gen(mm)
-            _seq_publish(mm, so, (cur | 1) + 1)
+        self._mmq[sw] = s
         self._cache.pop(name, None)
 
     def _tombstone_torn(self, name: str, so: int) -> None:
         """Best effort: tombstone a slot we left odd after a failed write."""
         try:
-            with self._lock:
+            with self._sync:
                 self._tombstone_locked(so)
             self._cache.pop(name, None)
         except Exception:
@@ -1668,7 +1897,7 @@ class Globals:
         h = zlib.crc32(nb)
         n = blob_len - 1 - len(header)      # payload length sized into the slot
         mm = self._mm
-        with self._lock:
+        with self._sync:
             g0, frz = _QQ.unpack_from(mm, _OFF_GEN)
             if frz:
                 self._recover_freeze_locked()   # heal a leaked freeze flag
@@ -1890,7 +2119,7 @@ class Globals:
         nb = name.encode("utf-8")
         h = zlib.crc32(nb)
         mm = self._mm
-        with self._wlock, self._lock:
+        with self._wlock, self._sync:
             so, found, f, _ = self._probe_locked(nb, h)
             if not found:
                 return False
@@ -1913,32 +2142,38 @@ class Globals:
         """Give up write ownership so another process may claim the variable."""
         nb = name.encode("utf-8")
         h = zlib.crc32(nb)
-        mm = self._mm
-        with self._wlock, self._lock:
+        with self._wlock, self._sync:
             so, found, f, _ = self._probe_locked(nb, h)
             if not found:
                 raise KeyError(name)
             if f[5] and not (f[5] == _MY_PID and f[6] == _MY_TOKEN) \
                     and _pid_alive(f[5], f[6]):
                 raise OwnershipError(f"{name!r} is owned by pid {f[5]}")
-            s = _U64.unpack_from(mm, so)[0]
-            if s & 1:
-                # The (dead) owner was killed mid-write: the blob is torn.
+            self._disown_locked(so, f)
+        self._cache.pop(name, None)
+
+    def _disown_locked(self, so: int, f) -> None:
+        """Mutex held: clear one slot's owner fields, keeping the value."""
+        mm = self._mm
+        s = _U64.unpack_from(mm, so)[0]
+        if s & 1:
+            if f[5] and not _pid_alive(f[5], f[6]):
+                # The owner was killed mid-write: the blob is torn.
                 # Republishing it as stable would hand readers garbage —
                 # tombstone it instead; the variable's last value is lost.
                 self._tombstone_locked(so)
-                self._cache.pop(name, None)
                 return
-            _SLOT.pack_into(mm, so, s + 1, _S_OCCUPIED, f[2], f[3], f[4],
-                            0, 0, f[7], f[8], f[9])
-            _seq_publish(mm, so, s + 2)
-            # Ownership changed: invalidate every process's cached owned=True
-            # binding (a sibling handle of the old owner would otherwise keep
-            # writing lock-free after someone else claims the variable).
-            _bump_gen(mm)
-        ent = self._cache.get(name)
-        if ent is not None:
-            ent[3] = False
+            # Unowned (or ours, and we hold _wlock): no write is in flight,
+            # so this is a stray odd store from an invalidated binding and
+            # the blob is whole — just step over it.
+            s += 1
+        _SLOT.pack_into(mm, so, s + 1, _S_OCCUPIED, f[2], f[3], f[4],
+                        0, 0, f[7], f[8], f[9])
+        _seq_publish(mm, so, s + 2)
+        # Ownership changed: invalidate every process's cached owned=True
+        # binding (a sibling handle of the old owner would otherwise keep
+        # writing lock-free after someone else claims the variable).
+        _bump_gen(mm)
 
     # ---- public dunder / dict-style API ---------------------------------------
 
@@ -2015,7 +2250,7 @@ class Globals:
     def keys(self) -> list[str]:
         mm = self._mm
         out = []
-        with self._lock:
+        with self._sync:
             base, sc = self._slots_off, self._slot_count
             for i in range(sc):
                 f = _SLOT.unpack_from(mm, base + i * _SLOT_SIZE)
@@ -2041,20 +2276,29 @@ class Globals:
         return iter(self.keys())
 
     def owner_of(self, name: str) -> int | None:
-        """Pid of the variable's owning process (None if unowned/missing)."""
+        """Pid of the process that owns the variable, or None when it is
+        unowned, missing, or its recorded owner has died — i.e. None means
+        'this process may write it', matching what the write paths enforce."""
         nb = name.encode("utf-8")
         so, f, _ = self._find(nb, zlib.crc32(nb))
-        if so is None:
+        if so is None or not f[5] or not _pid_alive(f[5], f[6]):
             return None
-        return f[5] or None
+        return f[5]
 
     def wait_for(self, name: str, timeout: float | None = None) -> Any:
-        """Block until another process publishes `name`; return its value."""
+        """Block until another process publishes `name`; return its value.
+
+        The delivered value becomes wait_change()'s reference point, so the
+        usual `wait_for` then `wait_change` loop cannot swallow a publish
+        that lands while the caller is still processing the first value."""
         deadline = None if timeout is None else time.monotonic() + timeout
         delay = 0.00005
         while True:
             v = self._peek(name)
             if v is not _MISSING:
+                ent = self._cache.get(name)
+                if ent is not None:
+                    self._seen[name] = self._mmq[ent[0] >> 3]
                 return v
             if deadline is not None and time.monotonic() > deadline:
                 raise TimeoutError(f"timed out waiting for {name!r}")
@@ -2069,10 +2313,15 @@ class Globals:
                 frame = g.wait_change("frame")
 
         Detection is the slot's seqlock counter: every publish advances it.
-        Rarely (when the namespace compacts, or any variable is deleted,
-        between polls) a wakeup may deliver an unchanged value.
+        The reference point is the counter of the value this handle last
+        RETURNED, not the counter at call entry, so a publish that lands
+        while the caller is still processing the previous value is delivered
+        by the next call instead of being swallowed. Rarely (when the
+        namespace compacts, or any variable is deleted, between polls) a
+        wakeup may deliver an unchanged value.
         """
         mmq = self._mmq
+        seen = self._seen
         deadline = None if timeout is None else time.monotonic() + timeout
         ref_gen = None                  # None -> any publish wakes us
         ent = self._cache.get(name)
@@ -2083,17 +2332,25 @@ class Globals:
                 ent = None
         if ent is not None:
             ref_gen, ref_so = ent[1], ent[0]
-            ref_seq = mmq[ref_so >> 3]
+            ref_seq = seen.get(name)
+            if ref_seq is None:         # nothing delivered yet: wait for the
+                ref_seq = mmq[ref_so >> 3]      # next publish, as documented
         delay = 0.00005
         while True:
             if ref_gen is None:
                 v = self._peek(name)
                 if v is not _MISSING:
+                    ent = self._cache.get(name)
+                    if ent is not None:
+                        seen[name] = mmq[ent[0] >> 3]
                     return v
             elif mmq[_OFF_GEN_W] != ref_gen \
                     or mmq[ref_so >> 3] != ref_seq:
                 v = self._peek(name)
                 if v is not _MISSING:
+                    ent = self._cache.get(name)
+                    if ent is not None:
+                        seen[name] = mmq[ent[0] >> 3]
                     return v
                 ref_gen = None          # deleted: wait for a republish
             if deadline is not None and time.monotonic() > deadline:
@@ -2104,7 +2361,7 @@ class Globals:
     def clear(self) -> None:
         """Drop every variable in the namespace (any process may call)."""
         mm = self._mm
-        with self._wlock, self._lock:
+        with self._wlock, self._sync:
             base, sc = self._slots_off, self._slot_count
             settled = False
             try:
@@ -2162,14 +2419,37 @@ EasyGlobals = Globals          # compat alias (kept out of __all__ on purpose)
 _RESERVED = frozenset(n for n in dir(Globals) if not n.startswith("_"))
 
 
+def _close_all() -> None:
+    """Interpreter exit: close whatever handles are still alive. ONE hook for
+    the whole module — an atexit callback bound to each instance would keep
+    every handle alive forever (and its fds with it)."""
+    for g in list(_INSTANCES):
+        try:
+            g.close()
+        except Exception:
+            pass
+
+
 def _after_fork() -> None:
+    global _FORK_WARNED_PID
     _refresh_identity()
+    if _FORK_WARNED_PID != _MY_PID:
+        _FORK_WARNED_PID = _MY_PID
+        warnings.warn(
+            "EasyGlobals does not support the 'fork' start method: a fork "
+            "that happens while any process holds the structural mutex "
+            "leaves the child blocked on it forever, and the child shares "
+            "the parent's file descriptors. Use spawn "
+            "(multiprocessing.get_context('spawn')) instead.",
+            RuntimeWarning, stacklevel=2)
     for ns in list(_NS_LOCKS):
         _NS_LOCKS[ns] = threading.Lock()   # parent thread may hold the old one
     for g in list(_INSTANCES):
         try:
             g._cache.clear()
+            g._seen.clear()
             object.__setattr__(g, "_wlock", _NS_LOCKS[g._ns])
+            object.__setattr__(g, "_slock", threading.RLock())
             # Recreate the kernel mutex: the flock fallback's lock lives on
             # the open file description, which fork SHARES — parent and
             # child would otherwise pass through each other's exclusion.
@@ -2187,7 +2467,11 @@ def _after_fork() -> None:
                     # orphan. Registering into it would split-brain the child
                     # against every future attacher of the same name.
                     raise RuntimeError("segment died across fork")
-                g._prune_and_maybe_wipe()
+                # Prune WITHOUT wiping, then register: the child inherits the
+                # parent's variables and is itself a live attacher, so it must
+                # never hit the "no attacher left alive" case and wipe them (a
+                # daemonizing parent exits immediately after the fork).
+                g._prune_and_maybe_wipe(False)
                 g._register_self()
         except Exception:
             # Never keep using a handle that could not re-register (dead
@@ -2200,6 +2484,10 @@ def _after_fork() -> None:
             except Exception:
                 pass
 
+
+_FORK_WARNED_PID = None        # warn once per process, not once per fork chain
+
+atexit.register(_close_all)
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_after_fork)
